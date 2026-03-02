@@ -1,0 +1,23 @@
+{
+  "manifest_version": 3,
+  "name": "PinForge",
+  "version": "0.1.0",
+  "description": "Automate Pinterest pin generation and Publer scheduling from WordPress posts.",
+  "permissions": ["storage", "alarms", "activeTab", "scripting", "tabs"],
+  "host_permissions": ["https://app.publer.com/*", "https://*/*", "http://*/*"],
+  "action": {
+    "default_title": "PinForge",
+    "default_popup": "index.html"
+  },
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://*/*", "http://*/*"],
+      "js": ["scraper.js"],
+      "run_at": "document_idle"
+    }
+  ]
+}
