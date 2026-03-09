@@ -17,19 +17,30 @@ const MIN_DIMENSION = 350
 const IGNORE_NAME_PATTERN = /(logo|icon|sprite)/i
 
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
-  if (message?.type !== 'PINFORGE_SCRAPE') {
-    return false
+  if (message?.type === 'PINFORGE_SCRAPE') {
+    try {
+      const data = scrapePage()
+      sendResponse({ ok: true, data })
+    } catch (error) {
+      const text = error instanceof Error ? error.message : String(error)
+      sendResponse({ ok: false, error: text })
+    }
+
+    return true
   }
 
-  try {
-    const data = scrapePage()
-    sendResponse({ ok: true, data })
-  } catch (error) {
-    const text = error instanceof Error ? error.message : String(error)
-    sendResponse({ ok: false, error: text })
+  if (message?.type === 'PINFORGE_FETCH_IMAGE_AS_DATA_URL') {
+    void fetchImageAsDataUrl(typeof message.imageUrl === 'string' ? message.imageUrl : '')
+      .then((data) => sendResponse({ ok: true, data }))
+      .catch((error) => {
+        const text = error instanceof Error ? error.message : String(error)
+        sendResponse({ ok: false, error: text })
+      })
+
+    return true
   }
 
-  return true
+  return false
 })
 
 function scrapePage(): ScrapeResult {
@@ -204,4 +215,78 @@ function getSurroundingText(image: HTMLImageElement): string {
     image.parentElement?.previousElementSibling
 
   return paragraph?.textContent?.trim().slice(0, 240) ?? ''
+}
+
+async function fetchImageAsDataUrl(imageUrl: string): Promise<{
+  dataUrl: string
+  mimeType: string
+  filename: string
+}> {
+  const normalizedUrl = imageUrl.trim()
+  if (normalizedUrl === '') {
+    throw new Error('Image URL is required for Studio temp upload.')
+  }
+
+  const response = await fetch(normalizedUrl)
+  if (!response.ok) {
+    throw new Error(
+      `Failed to fetch image from page context (${response.status} ${response.statusText}).`,
+    )
+  }
+
+  const blob = await response.blob()
+  const mimeType = blob.type || inferMimeTypeFromUrl(normalizedUrl) || 'application/octet-stream'
+  const dataUrl = await blobToDataUrl(blob)
+  return {
+    dataUrl,
+    mimeType,
+    filename: buildFilename(normalizedUrl, mimeType),
+  }
+}
+
+function blobToDataUrl(blob: Blob): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader()
+    reader.onload = () => {
+      if (typeof reader.result === 'string') {
+        resolve(reader.result)
+        return
+      }
+      reject(new Error('Unable to convert image blob to data URL.'))
+    }
+    reader.onerror = () => reject(reader.error ?? new Error('Image read failed.'))
+    reader.readAsDataURL(blob)
+  })
+}
+
+function buildFilename(imageUrl: string, mimeType: string): string {
+  try {
+    const parsed = new URL(imageUrl, window.location.href)
+    const candidate = parsed.pathname.split('/').pop()?.trim() ?? ''
+    if (candidate !== '') {
+      return candidate
+    }
+  } catch {
+    // Ignore URL parsing fallback.
+  }
+
+  const extension = mimeType.split('/')[1]?.replace(/[^a-z0-9]/gi, '').toLowerCase() || 'bin'
+  return `pinforge-image.${extension}`
+}
+
+function inferMimeTypeFromUrl(imageUrl: string): string {
+  const lowerUrl = imageUrl.toLowerCase()
+  if (lowerUrl.includes('.png')) {
+    return 'image/png'
+  }
+  if (lowerUrl.includes('.webp')) {
+    return 'image/webp'
+  }
+  if (lowerUrl.includes('.gif')) {
+    return 'image/gif'
+  }
+  if (lowerUrl.includes('.svg')) {
+    return 'image/svg+xml'
+  }
+  return 'image/jpeg'
 }

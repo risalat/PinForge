@@ -26,10 +26,16 @@ import {
   type ArticleImageCoverage,
 } from '../../storage/articleCoverageRepository'
 import { cacheMediaId, loadWorkspaceMediaCache } from '../../storage/mediaCacheRepository'
+import {
+  StudioClient,
+  type StudioGeneratePayload,
+  type StudioImagePayload,
+} from '../../lib/studioClient'
 import type { PinCopy } from '../../lib/validators'
 import type { PinDraft, PinJob, PinJobStatus } from '../../types/pinforge'
 
 const SETTINGS_KEY = 'pinforge.settings'
+const DEFAULT_STUDIO_BASE_URL = 'https://pin-forge-studio.vercel.app'
 
 interface SettingsState {
   apiKey: string
@@ -41,6 +47,8 @@ interface SettingsState {
   aiApiKey: string
   aiModel: string
   aiCustomEndpoint: string
+  studioBaseUrl: string
+  studioApiKey: string
 }
 
 interface ScheduleSettings {
@@ -96,6 +104,12 @@ interface SchedulePublishState {
   error?: string
 }
 
+interface StudioSendSummary {
+  sentAt: string
+  uploadedImageCount: number
+  responsePreview: string
+}
+
 const DEFAULT_SETTINGS: SettingsState = {
   apiKey: '',
   workspaceId: '',
@@ -106,6 +120,8 @@ const DEFAULT_SETTINGS: SettingsState = {
   aiApiKey: '',
   aiModel: '',
   aiCustomEndpoint: '',
+  studioBaseUrl: DEFAULT_STUDIO_BASE_URL,
+  studioApiKey: '',
 }
 
 const AI_PROVIDER_OPTIONS: Array<{ value: AIProvider; label: string }> = [
@@ -141,6 +157,7 @@ export function PopupApp() {
   const [isGeneratingCopy, setIsGeneratingCopy] = useState(false)
   const [isUploadingMedia, setIsUploadingMedia] = useState(false)
   const [isSchedulingPosts, setIsSchedulingPosts] = useState(false)
+  const [isSendingToStudio, setIsSendingToStudio] = useState(false)
   const [scrapeResult, setScrapeResult] = useState<ScrapeResultView | null>(null)
   const [selectedImageIds, setSelectedImageIds] = useState<string[]>([])
   const [copyByImageId, setCopyByImageId] = useState<Record<string, ImageCopyState>>({})
@@ -158,6 +175,8 @@ export function PopupApp() {
   const [titleStyle, setTitleStyle] = useState<TitleStyle>('balanced')
   const [boardSearchInput, setBoardSearchInput] = useState('')
   const [coverageSearchInput, setCoverageSearchInput] = useState('')
+  const [studioKeywordsInput, setStudioKeywordsInput] = useState('')
+  const [studioSendSummary, setStudioSendSummary] = useState<StudioSendSummary | null>(null)
   const [coverageRecords, setCoverageRecords] = useState<ArticleCoverageRecord[]>([])
   const [currentArticleCoverage, setCurrentArticleCoverage] =
     useState<ArticleCoverageRecord | null>(null)
@@ -165,7 +184,7 @@ export function PopupApp() {
   const [isLoadingAiModels, setIsLoadingAiModels] = useState(false)
   const [workspaceOptions, setWorkspaceOptions] = useState<PublerWorkspace[]>([])
   const [isLoadingWorkspaces, setIsLoadingWorkspaces] = useState(false)
-  const [activeTab, setActiveTab] = useState<'settings' | 'run' | 'done'>('run')
+  const [activeTab, setActiveTab] = useState<'settings' | 'run' | 'studio' | 'done'>('run')
 
   useEffect(() => {
     void loadSettings()
@@ -207,6 +226,7 @@ export function PopupApp() {
 
   const selectedImageCount = selectedImages.length
   const aiConfigError = getAiConfigurationError(settings)
+  const studioConfigError = getStudioConfigurationError(settings)
 
   const schedulePreview = useMemo(
     () =>
@@ -872,6 +892,13 @@ export function PopupApp() {
     })
   }
 
+  function createStudioClient(): StudioClient {
+    return new StudioClient({
+      baseUrl: settings.studioBaseUrl,
+      apiKey: settings.studioApiKey,
+    })
+  }
+
   function generateRunJobId(): string {
     const seed = `${settings.workspaceId}:${Date.now()}:${Math.random()}`
     return `run-${Math.abs(hashString(seed))}`
@@ -1082,6 +1109,7 @@ export function PopupApp() {
       setLastScheduleJobId('')
       setActiveRunJobId('')
       setSelectedCopyIds(normalized.images.map((image) => image.id))
+      setStudioSendSummary(null)
       await refreshCurrentArticleCoverage(normalized.canonicalUrl, normalized.images)
       setStatus(`Scrape complete. ${normalized.images.length} eligible image(s) found.`)
     } catch (error) {
@@ -1340,6 +1368,132 @@ export function PopupApp() {
         ),
       })),
     }
+  }
+
+  async function sendSelectedToStudio(): Promise<void> {
+    if (!scrapeResult) {
+      setStatus('Run scraper first before sending to Studio.')
+      return
+    }
+    if (selectedImages.length === 0) {
+      setStatus('Select at least one image before sending to Studio.')
+      return
+    }
+    if (studioConfigError) {
+      setStatus(studioConfigError)
+      return
+    }
+
+    setIsSendingToStudio(true)
+    setStatus(`Preparing ${selectedImages.length} selected image(s) for Studio...`)
+
+    try {
+      const client = createStudioClient()
+      let uploadedImageCount = 0
+
+      const studioImages = await Promise.all(
+        selectedImages.map(async (image) => {
+          const studioUrl = await resolveStudioImageUrl(client, image)
+          if (studioUrl !== image.image_url) {
+            uploadedImageCount += 1
+          }
+
+          const mapped: StudioImagePayload = {
+            url: studioUrl,
+            alt: image.alt || undefined,
+            caption: image.caption || undefined,
+            nearestHeading: image.nearest_heading || undefined,
+            sectionHeadingPath:
+              image.section_heading_path.length > 0 ? image.section_heading_path : undefined,
+            surroundingTextSnippet: image.surrounding_text_snippet || undefined,
+          }
+          return mapped
+        }),
+      )
+
+      const payload = buildStudioPayloadForImages(studioImages)
+      const response = await client.generatePins(payload)
+      const responsePreview = summarizeStudioResponse(response)
+
+      setStudioSendSummary({
+        sentAt: new Date().toISOString(),
+        uploadedImageCount,
+        responsePreview,
+      })
+      setStatus(
+        `Sent ${studioImages.length} image(s) to Studio. Temp uploads used: ${uploadedImageCount}.`,
+      )
+    } catch (error) {
+      const text = error instanceof Error ? error.message : String(error)
+      setStatus(`Studio send failed: ${text}`)
+    } finally {
+      setIsSendingToStudio(false)
+    }
+  }
+
+  function buildStudioPayloadForImages(images: StudioImagePayload[]): StudioGeneratePayload {
+    if (!scrapeResult) {
+      throw new Error('Scrape result unavailable for Studio payload.')
+    }
+
+    const keywords = parseKeywordsInput(studioKeywordsInput)
+    return {
+      postUrl: scrapeResult.canonicalUrl,
+      title: scrapeResult.postTitle,
+      domain: extractDomain(scrapeResult.canonicalUrl) ?? undefined,
+      keywords: keywords.length > 0 ? keywords : undefined,
+      images,
+    }
+  }
+
+  async function resolveStudioImageUrl(client: StudioClient, image: ScrapedImage): Promise<string> {
+    if (isDirectStudioImageUrl(image.image_url)) {
+      return image.image_url
+    }
+
+    const tempFile = await buildStudioTempFile(image.image_url)
+    const upload = await client.uploadTempImage(tempFile, {
+      sourceUrl: image.image_url,
+      alt: image.alt || undefined,
+      caption: image.caption || undefined,
+      nearestHeading: image.nearest_heading || undefined,
+      sectionHeadingPath:
+        image.section_heading_path.length > 0 ? image.section_heading_path : undefined,
+      surroundingTextSnippet: image.surrounding_text_snippet || undefined,
+      filename: tempFile.name,
+    })
+    return upload.assetUrl
+  }
+
+  async function buildStudioTempFile(imageUrl: string): Promise<File> {
+    const [currentTab] = await chrome.tabs.query({ active: true, currentWindow: true })
+    if (!currentTab?.id) {
+      throw new Error(
+        'No active article tab found for Studio temp upload. Re-open the source page and try again.',
+      )
+    }
+
+    const response = await requestImageAssetWithInjectionFallback(currentTab.id, imageUrl)
+    if (!response?.ok || !response.data || !isObject(response.data)) {
+      throw new Error(response?.error ?? 'Could not resolve non-http image for Studio upload.')
+    }
+
+    const dataUrl =
+      typeof response.data.dataUrl === 'string' ? response.data.dataUrl.trim() : ''
+    if (dataUrl === '') {
+      throw new Error('Studio temp upload fallback did not return image data.')
+    }
+
+    const mimeType =
+      typeof response.data.mimeType === 'string' && response.data.mimeType.trim() !== ''
+        ? response.data.mimeType.trim()
+        : 'application/octet-stream'
+    const filename =
+      typeof response.data.filename === 'string' && response.data.filename.trim() !== ''
+        ? response.data.filename.trim()
+        : `pinforge-image.${inferExtensionFromMimeType(mimeType)}`
+
+    return dataUrlToFile(dataUrl, filename, mimeType)
   }
 
   async function uploadSelectedMediaToLibrary(): Promise<void> {
@@ -1906,9 +2060,10 @@ export function PopupApp() {
     <main className="popup-shell">
       <header>
         <p className="eyebrow">PinForge</p>
-        <h1>Pinterest Pin Scheduler</h1>
+        <h1>PinForge Extension</h1>
         <p className="subtitle">
-          Scrape images, generate copy, and schedule Pinterest pins through Publer.
+          Scrape article images, schedule pins through Publer, or send selected image context to
+          PinForge Studio.
         </p>
       </header>
 
@@ -1919,6 +2074,13 @@ export function PopupApp() {
           onClick={() => setActiveTab('run')}
         >
           Run
+        </button>
+        <button
+          type="button"
+          className={activeTab === 'studio' ? 'tab-button active' : 'tab-button'}
+          onClick={() => setActiveTab('studio')}
+        >
+          Studio
         </button>
         <button
           type="button"
@@ -1994,6 +2156,55 @@ export function PopupApp() {
           </button>
           <button
             disabled={isLoading || isGeneratingCopy || isUploadingMedia || isSchedulingPosts}
+            onClick={() => void saveSettings()}
+          >
+            Save Settings
+          </button>
+        </div>
+      </section>
+
+      <section className="card">
+        <p className="eyebrow">Studio Settings</p>
+        <label htmlFor="studio-base-url">Studio Base URL</label>
+        <input
+          id="studio-base-url"
+          type="url"
+          placeholder={DEFAULT_STUDIO_BASE_URL}
+          value={settings.studioBaseUrl}
+          onChange={(event) =>
+            setSettings((current) => ({ ...current, studioBaseUrl: event.target.value }))
+          }
+        />
+
+        <label htmlFor="studio-api-key">Studio API Key</label>
+        <input
+          id="studio-api-key"
+          type="password"
+          placeholder="Bearer token for PinForge Studio"
+          value={settings.studioApiKey}
+          onChange={(event) =>
+            setSettings((current) => ({ ...current, studioApiKey: event.target.value }))
+          }
+        />
+
+        <p className="muted no-margin">
+          Auth header: <strong>Authorization: Bearer &lt;api_key&gt;</strong>
+        </p>
+        <p className="muted no-margin">
+          Saved key preview:{' '}
+          <strong>{settings.studioApiKey.trim() ? formatMaskedSecret(settings.studioApiKey) : 'N/A'}</strong>
+        </p>
+        {studioConfigError && <p className="error-text no-margin">{studioConfigError}</p>}
+
+        <div className="actions">
+          <button
+            disabled={
+              isLoading ||
+              isGeneratingCopy ||
+              isUploadingMedia ||
+              isSchedulingPosts ||
+              isSendingToStudio
+            }
             onClick={() => void saveSettings()}
           >
             Save Settings
@@ -2800,6 +3011,173 @@ export function PopupApp() {
         </>
       )}
 
+      {activeTab === 'studio' && (
+        <>
+      <section className="card card-scrape">
+        <p className="eyebrow">Studio Payload</p>
+        <div className="actions">
+          <button
+            disabled={
+              isLoading ||
+              isGeneratingCopy ||
+              isUploadingMedia ||
+              isSchedulingPosts ||
+              isSendingToStudio
+            }
+            onClick={() => void scrapeCurrentTab()}
+          >
+            Use Current Tab
+          </button>
+          <button
+            disabled={
+              isLoading ||
+              isGeneratingCopy ||
+              isUploadingMedia ||
+              isSchedulingPosts ||
+              isSendingToStudio ||
+              !scrapeResult ||
+              scrapeResult.images.length === 0
+            }
+            onClick={selectAllImages}
+          >
+            Select All
+          </button>
+          <button
+            className="button-secondary"
+            disabled={
+              isLoading ||
+              isGeneratingCopy ||
+              isUploadingMedia ||
+              isSchedulingPosts ||
+              isSendingToStudio ||
+              selectedImageCount === 0
+            }
+            onClick={clearImageSelection}
+          >
+            Clear Selection
+          </button>
+        </div>
+
+        {!scrapeResult && (
+          <p className="muted">
+            No scrape data yet. Use the current tab here or in the Run tab.
+          </p>
+        )}
+
+        {scrapeResult && (
+          <>
+            <div className="preview-box">
+              <p>
+                <strong>Title:</strong> {scrapeResult.postTitle}
+              </p>
+              <p>
+                <strong>URL:</strong> {scrapeResult.canonicalUrl}
+              </p>
+              <p>
+                <strong>Domain:</strong> {extractDomain(scrapeResult.canonicalUrl) ?? 'N/A'}
+              </p>
+              <p>
+                <strong>Selected images:</strong> {selectedImageCount}/{scrapeResult.images.length}
+              </p>
+            </div>
+
+            <label htmlFor="studio-keywords-input">
+              Keywords (comma or newline separated, optional)
+            </label>
+            <textarea
+              id="studio-keywords-input"
+              className="copy-textarea"
+              rows={2}
+              placeholder="example: farmhouse kitchen, small patio decor"
+              value={studioKeywordsInput}
+              onChange={(event) => setStudioKeywordsInput(event.target.value)}
+            />
+
+            {studioConfigError && <p className="error-text no-margin">{studioConfigError}</p>}
+
+            <div className="actions">
+              <button
+                disabled={
+                  isLoading ||
+                  isGeneratingCopy ||
+                  isUploadingMedia ||
+                  isSchedulingPosts ||
+                  isSendingToStudio ||
+                  !scrapeResult ||
+                  selectedImageCount === 0 ||
+                  studioConfigError !== null
+                }
+                onClick={() => void sendSelectedToStudio()}
+              >
+                {isSendingToStudio ? 'Sending To Studio...' : 'Send to Studio'}
+              </button>
+            </div>
+
+            {studioSendSummary && (
+              <div className="preview-box">
+                <p>
+                  <strong>Last send:</strong> {formatDateTime(studioSendSummary.sentAt)}
+                </p>
+                <p>
+                  <strong>Temp uploads:</strong> {studioSendSummary.uploadedImageCount}
+                </p>
+                <p>
+                  <strong>Response:</strong> {studioSendSummary.responsePreview}
+                </p>
+              </div>
+            )}
+
+            {scrapeResult.images.length === 0 && (
+              <p className="muted">No eligible images found for current tab.</p>
+            )}
+
+            {scrapeResult.images.length > 0 && (
+              <div className="image-list">
+                {scrapeResult.images.map((image) => {
+                  const isSelected = selectedImageIds.includes(image.id)
+                  const usesTempUpload = !isDirectStudioImageUrl(image.image_url)
+                  return (
+                    <article key={`studio:${image.id}`} className={`image-item${isSelected ? ' selected' : ''}`}>
+                      <div className="image-select">
+                        <input
+                          className="image-checkbox"
+                          type="checkbox"
+                          checked={isSelected}
+                          onChange={() => toggleImageSelection(image.id)}
+                        />
+                      </div>
+                      <img
+                        src={image.image_url}
+                        alt={image.alt || 'Studio image'}
+                        className="image-thumb"
+                        loading="lazy"
+                      />
+                      <div className="image-meta">
+                        <p>
+                          <strong>Heading:</strong> {image.nearest_heading || 'N/A'}
+                        </p>
+                        <p>
+                          <strong>Caption:</strong> {trimText(image.caption || 'N/A', 120)}
+                        </p>
+                        <p>
+                          <strong>Alt:</strong> {trimText(image.alt || 'N/A', 120)}
+                        </p>
+                        <p>
+                          <strong>Studio source:</strong>{' '}
+                          {usesTempUpload ? 'Temp upload fallback' : 'Direct URL'}
+                        </p>
+                      </div>
+                    </article>
+                  )
+                })}
+              </div>
+            )}
+          </>
+        )}
+      </section>
+        </>
+      )}
+
       {activeTab === 'done' && (
         <section className="card card-done-list">
           <p className="eyebrow">Article Coverage</p>
@@ -2882,6 +3260,41 @@ async function requestScrapeWithInjectionFallback(
   })
 
   return (await chrome.tabs.sendMessage(tabId, { type: 'PINFORGE_SCRAPE' })) as {
+    ok?: boolean
+    data?: unknown
+    error?: string
+  }
+}
+
+async function requestImageAssetWithInjectionFallback(
+  tabId: number,
+  imageUrl: string,
+): Promise<{ ok?: boolean; data?: unknown; error?: string }> {
+  try {
+    return (await chrome.tabs.sendMessage(tabId, {
+      type: 'PINFORGE_FETCH_IMAGE_AS_DATA_URL',
+      imageUrl,
+    })) as {
+      ok?: boolean
+      data?: unknown
+      error?: string
+    }
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error)
+    if (!message.includes('Receiving end does not exist')) {
+      throw error
+    }
+  }
+
+  await chrome.scripting.executeScript({
+    target: { tabId },
+    files: ['scraper.js'],
+  })
+
+  return (await chrome.tabs.sendMessage(tabId, {
+    type: 'PINFORGE_FETCH_IMAGE_AS_DATA_URL',
+    imageUrl,
+  })) as {
     ok?: boolean
     data?: unknown
     error?: string
@@ -3458,6 +3871,73 @@ function sanitizeCopyText(value: string, maxLength: number): string {
   return normalizedSpace.slice(0, maxLength)
 }
 
+function summarizeStudioResponse(response: unknown): string {
+  if (typeof response === 'string') {
+    return trimText(response, 240)
+  }
+
+  if (Array.isArray(response)) {
+    return trimText(JSON.stringify(response), 240)
+  }
+
+  if (isObject(response)) {
+    const keys = Object.keys(response)
+    const summary = keys.length > 0 ? JSON.stringify(response) : 'Studio returned an empty object.'
+    return trimText(summary, 240)
+  }
+
+  return trimText(String(response), 240)
+}
+
+function isDirectStudioImageUrl(imageUrl: string): boolean {
+  return /^https?:\/\//i.test(imageUrl.trim())
+}
+
+function extractDomain(url: string): string | null {
+  try {
+    return new URL(url).hostname || null
+  } catch {
+    return null
+  }
+}
+
+function inferExtensionFromMimeType(mimeType: string): string {
+  const normalized = mimeType.toLowerCase()
+  if (normalized.includes('png')) {
+    return 'png'
+  }
+  if (normalized.includes('webp')) {
+    return 'webp'
+  }
+  if (normalized.includes('gif')) {
+    return 'gif'
+  }
+  if (normalized.includes('svg')) {
+    return 'svg'
+  }
+  return 'jpg'
+}
+
+function dataUrlToFile(dataUrl: string, filename: string, mimeType: string): File {
+  const match = dataUrl.match(/^data:([^;,]+)?(;base64)?,(.*)$/)
+  if (!match) {
+    throw new Error('Invalid data URL returned for Studio temp upload.')
+  }
+
+  const [, inlineMimeType, isBase64Flag, rawData] = match
+  const resolvedMimeType = inlineMimeType?.trim() || mimeType
+  const data = isBase64Flag ? atob(rawData) : decodeURIComponent(rawData)
+  const bytes = new Uint8Array(data.length)
+  for (let index = 0; index < data.length; index += 1) {
+    bytes[index] = data.charCodeAt(index)
+  }
+
+  return new File([bytes], filename, {
+    type: resolvedMimeType,
+    lastModified: Date.now(),
+  })
+}
+
 function parseKeywordsInput(value: string): string[] {
   const parts = value
     .split(/[\n,]/)
@@ -3570,4 +4050,25 @@ function getAiConfigurationError(settings: SettingsState): string | null {
     return `Set ${getAiProviderLabel(settings.aiProvider)} model before generating copy.`
   }
   return null
+}
+
+function getStudioConfigurationError(settings: SettingsState): string | null {
+  if (settings.studioBaseUrl.trim() === '') {
+    return 'Set Studio Base URL before using the Studio tab.'
+  }
+  if (settings.studioApiKey.trim() === '') {
+    return 'Set Studio API key before using the Studio tab.'
+  }
+  return null
+}
+
+function formatMaskedSecret(value: string): string {
+  const trimmed = value.trim()
+  if (trimmed === '') {
+    return ''
+  }
+  if (trimmed.length <= 4) {
+    return '*'.repeat(trimmed.length)
+  }
+  return `${'*'.repeat(Math.max(4, trimmed.length - 4))}${trimmed.slice(-4)}`
 }
